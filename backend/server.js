@@ -1455,43 +1455,42 @@ app.get('/stream-local-video', (req, res) => {
       return res.status(400).send('Invalid video file')
     }
 
-    const fileSize = stat.size
-    const ext = path.extname(cleaned).toLowerCase()
-    const mimeTypes = {
-      '.avi': 'video/x-msvideo',
-      '.mp4': 'video/mp4',
-      '.m4v': 'video/mp4',
-      '.webm': 'video/webm',
-      '.mov': 'video/quicktime',
-      '.mkv': 'video/x-matroska',
-      '.mpeg': 'video/mpeg',
-      '.mpg': 'video/mpeg'
-    }
-    const contentType = mimeTypes[ext] || 'video/mp4'
-    const range = req.headers.range
+    // Optional raw byte streaming if explicitly requested via raw=true
+    if (req.query.raw === 'true') {
+      const fileSize = stat.size
+      const ext = path.extname(cleaned).toLowerCase()
+      const mimeTypes = {
+        '.avi': 'video/x-msvideo',
+        '.mp4': 'video/mp4',
+        '.m4v': 'video/mp4',
+        '.webm': 'video/webm',
+        '.mov': 'video/quicktime',
+        '.mkv': 'video/x-matroska',
+        '.mpeg': 'video/mpeg',
+        '.mpg': 'video/mpeg'
+      }
+      const contentType = mimeTypes[ext] || 'video/mp4'
+      const range = req.headers.range
 
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-')
-      const start = parseInt(parts[0], 10)
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
-      const chunkSize = (end - start) + 1
-      const fileStream = fs.createReadStream(cleaned, { start, end })
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-')
+        const start = parseInt(parts[0], 10)
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+        const chunkSize = (end - start) + 1
+        const fileStream = fs.createReadStream(cleaned, { start, end })
 
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': contentType
-      })
-      fileStream.pipe(res)
-    } else {
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Content-Type': contentType,
-        'Accept-Ranges': 'bytes'
-      })
-      fs.createReadStream(cleaned).pipe(res)
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': contentType
+        })
+        return fileStream.pipe(res)
+      }
     }
+
+    // Default: Use browser-compatible stream (losslessly copies video & converts AC3/DTS/EAC3 audio to AAC in real-time)
+    return streamBrowserCompatibleVideo(cleaned, req, res)
   } catch (error) {
     console.error('Stream local video error:', error)
     res.status(500).send('Unable to stream local video')
