@@ -24,7 +24,7 @@ const parseTimeToSeconds = (str) => {
     return h * 3600 + m * 60 + s
   } else if (parts.length === 2) {
     const m = parseFloat(parts[0]) || 0
-    const s = parseFloat(parts[1]) || 0
+    const s = parseFloat(parts[2]) || 0
     return m * 60 + s
   }
   return parseFloat(normalized) || 0
@@ -60,6 +60,12 @@ const audioLanguageNames = {
   und: 'Unknown language'
 }
 
+const getAudioTrackLabel = (track) => {
+  const language = audioLanguageNames[String(track?.language || 'und').toLowerCase()] || track?.language || 'Unknown language'
+  const details = [track?.codec?.toUpperCase(), track?.isDefault ? 'Default' : null].filter(Boolean).join(' · ')
+  return details ? `Track ${track.index + 1}: ${language} (${details})` : `Track ${track.index + 1}: ${language}`
+}
+
 const SubtitleGenerator = () => {
   // Media & State
   const [file, setFile] = useState(null)
@@ -67,8 +73,13 @@ const SubtitleGenerator = () => {
   const [currentTime, setCurrentTime] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0)
-  const [aspectRatio, setAspectRatio] = useState('16:9') // '16:9', '9:16', '1:1'
-  const [subtitleStyle, setSubtitleStyle] = useState('standard') // 'standard', 'yellow', 'boxed'
+  const [aspectRatio, setAspectRatio] = useState('16:9')
+  const [subtitleStyle, setSubtitleStyle] = useState('standard')
+
+  // Multi-Track Audio Selection
+  const [audioTracks, setAudioTracks] = useState([])
+  const [selectedAudioTrack, setSelectedAudioTrack] = useState(0)
+  const [isProbingTracks, setIsProbingTracks] = useState(false)
 
   const [sourceLanguage, setSourceLanguage] = useState('auto')
   const [targetLanguage, setTargetLanguage] = useState('en')
@@ -103,9 +114,8 @@ const SubtitleGenerator = () => {
 
   // Editor Filter & View Options
   const [searchQuery, setSearchQuery] = useState('')
-  const [activeTab, setActiveTab] = useState('editor') // 'editor', 'extract', 'settings'
+  const [activeTab, setActiveTab] = useState('editor')
   const [showShortcuts, setShowShortcuts] = useState(false)
-  const [editingSegmentIndex, setEditingSegmentIndex] = useState(null)
 
   // Refs
   const fileInputRef = useRef(null)
@@ -176,9 +186,47 @@ const SubtitleGenerator = () => {
     Boolean(localVideoDetails) ||
     Boolean(videoPath.trim() && supportedVideoExtensions.some(ext => videoPath.trim().toLowerCase().endsWith(ext)))
 
+  // Multi-Track Audio Probe Effect
+  useEffect(() => {
+    const probeAudioTracks = async () => {
+      if (!file && !localVideoFile && !videoPath.trim()) {
+        setAudioTracks([])
+        setSelectedAudioTrack(0)
+        return
+      }
+
+      setIsProbingTracks(true)
+      try {
+        let response
+        if (videoPath.trim()) {
+          response = await axios.post('/api/prepare-stream', { videoPath: videoPath.trim() })
+        } else if (file || localVideoFile) {
+          const formData = new FormData()
+          formData.append('file', file || localVideoFile)
+          response = await axios.post('/api/prepare-stream', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+          })
+        }
+
+        if (response && response.data && Array.isArray(response.data.audioTracks)) {
+          setAudioTracks(response.data.audioTracks)
+          if (typeof response.data.selectedAudioTrack === 'number') {
+            setSelectedAudioTrack(response.data.selectedAudioTrack)
+          }
+        }
+      } catch (err) {
+        console.warn('Audio track probe warning:', err)
+      } finally {
+        setIsProbingTracks(false)
+      }
+    }
+
+    probeAudioTracks()
+  }, [file, localVideoFile, videoPath])
+
   useEffect(() => {
     if (videoPath && isSupportedVideoPath(videoPath)) {
-      setMediaUrl(`/api/stream-local-video?path=${encodeURIComponent(videoPath.trim())}`)
+      setMediaUrl(`/api/stream-local-video?path=${encodeURIComponent(videoPath.trim())}&audioTrack=${selectedAudioTrack}`)
       return
     }
 
@@ -195,7 +243,7 @@ const SubtitleGenerator = () => {
     }
 
     setMediaUrl(null)
-  }, [file, localVideoFile, videoPath])
+  }, [file, localVideoFile, videoPath, selectedAudioTrack])
 
   useEffect(() => {
     const fetchModels = async () => {
@@ -243,7 +291,6 @@ const SubtitleGenerator = () => {
   // Keyboard Navigation & Studio Shortcuts
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // Don't trigger hotkeys if typing in input/textarea/select
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
         return
       }
@@ -259,10 +306,10 @@ const SubtitleGenerator = () => {
         seekRelative(5)
       } else if (e.key === ',' && mediaRef.current) {
         e.preventDefault()
-        seekRelative(-0.04) // Frame back
+        seekRelative(-0.04)
       } else if (e.key === '.' && mediaRef.current) {
         e.preventDefault()
-        seekRelative(0.04) // Frame forward
+        seekRelative(0.04)
       } else if (e.key === '?' || (e.shiftKey && e.key === '/')) {
         e.preventDefault()
         setShowShortcuts((prev) => !prev)
@@ -456,10 +503,14 @@ const SubtitleGenerator = () => {
     try {
       let response
       if (videoPath.trim()) {
-        response = await axios.post('/api/extract-audio', { videoPath: videoPath.trim() })
+        response = await axios.post('/api/extract-audio', {
+          videoPath: videoPath.trim(),
+          audioTrack: selectedAudioTrack
+        })
       } else if (file || localVideoFile) {
         const formData = new FormData()
         formData.append('file', file || localVideoFile)
+        formData.append('audioTrack', selectedAudioTrack)
         response = await axios.post('/api/extract-audio', formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         })
@@ -480,7 +531,7 @@ const SubtitleGenerator = () => {
   const downloadExtractedAudio = (result) => {
     if (!result || !result.audioFileName) return
     const element = document.createElement('a')
-    element.href = `/api/download-extracted-audio?file=${encodeURIComponent(result.audioFileName)}`
+    element.href = `/api/download-extracted-audio/${encodeURIComponent(result.audioFileName)}`
     element.setAttribute('download', result.audioFileName)
     element.style.display = 'none'
     document.body.appendChild(element)
@@ -536,6 +587,7 @@ const SubtitleGenerator = () => {
           sourceLanguage,
           targetLanguage,
           model: translationModel,
+          audioTrack: selectedAudioTrack,
         })
       } else {
         const formData = new FormData()
@@ -543,6 +595,7 @@ const SubtitleGenerator = () => {
         formData.append('sourceLanguage', sourceLanguage)
         formData.append('targetLanguage', targetLanguage)
         formData.append('model', translationModel)
+        formData.append('audioTrack', selectedAudioTrack)
 
         response = await axios.post('/api/generate-subtitles', formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
@@ -593,6 +646,7 @@ const SubtitleGenerator = () => {
             sourceLanguage,
             targetLanguage,
             model: translationModel,
+            audioTrack: selectedAudioTrack,
           }),
           signal: abortController.signal,
         })
@@ -602,6 +656,7 @@ const SubtitleGenerator = () => {
         formData.append('sourceLanguage', sourceLanguage)
         formData.append('targetLanguage', targetLanguage)
         formData.append('model', translationModel)
+        formData.append('audioTrack', selectedAudioTrack)
 
         response = await fetch('/api/stream-subtitles', {
           method: 'POST',
@@ -659,6 +714,9 @@ const SubtitleGenerator = () => {
               }
               if (parsed.compatibleMediaUrl && isCurrentMediaVideo) {
                 setMediaUrl(parsed.compatibleMediaUrl)
+              }
+              if (Array.isArray(parsed.audioTracks)) {
+                setAudioTracks(parsed.audioTracks)
               }
             } else if (eventType === 'status') {
               setStreamingStatus(parsed.message || 'Processing live subtitles...')
@@ -838,6 +896,8 @@ const SubtitleGenerator = () => {
     setStreamBuffering(false)
     setSubtitleSessionId(null)
     setExtractResult(null)
+    setAudioTracks([])
+    setSelectedAudioTrack(0)
     setError(null)
     setExtractError(null)
     setUseExtractedError(null)
@@ -848,7 +908,6 @@ const SubtitleGenerator = () => {
     (sub) => currentTime >= sub.start && currentTime <= sub.end
   )
 
-  // Filtered Subtitles for Search
   const filteredSubtitles = useMemo(() => {
     if (!subtitles) return []
     if (!searchQuery.trim()) return subtitles
@@ -861,7 +920,6 @@ const SubtitleGenerator = () => {
     )
   }, [subtitles, searchQuery])
 
-  // Scroll active subtitle into view
   useEffect(() => {
     if (activeSubtitle && activeSubtitleRef.current && subtitleListRef.current) {
       activeSubtitleRef.current.scrollIntoView({
@@ -896,6 +954,9 @@ const SubtitleGenerator = () => {
             </span>
             {totalDuration > 0 && (
               <span className="spec-duration">{formatTime(totalDuration)}</span>
+            )}
+            {audioTracks.length > 1 && (
+              <span className="spec-audio-badge">🎵 {audioTracks.length} Audio Tracks</span>
             )}
           </div>
         </div>
@@ -973,7 +1034,6 @@ const SubtitleGenerator = () => {
                   <h3>Video Preview Stage</h3>
                 </div>
                 <div className="stage-controls-mini">
-                  {/* Aspect Ratio Toggle */}
                   <div className="mini-segmented">
                     <button
                       type="button"
@@ -1001,7 +1061,6 @@ const SubtitleGenerator = () => {
                     </button>
                   </div>
 
-                  {/* Subtitle Style Switcher */}
                   <select
                     className="mini-select"
                     value={subtitleStyle}
@@ -1054,7 +1113,6 @@ const SubtitleGenerator = () => {
                         )}
                       </video>
 
-                      {/* Studio Interactive Subtitle Overlay */}
                       {activeSubtitle && !isDirectVideoFullscreen && (
                         <div className={`studio-subtitle-overlay style-${subtitleStyle}`}>
                           <span>{activeSubtitle.text}</span>
@@ -1206,6 +1264,25 @@ const SubtitleGenerator = () => {
               {/* Engine Trigger & Controls */}
               <div className="studio-engine-dock">
                 <div className="engine-selectors">
+                  {/* Multi-Track Audio Selector */}
+                  {audioTracks && audioTracks.length > 0 && (
+                    <div className="engine-field audio-track-field">
+                      <label>🎵 Select Movie Audio Track ({audioTracks.length} Available)</label>
+                      <select
+                        value={selectedAudioTrack}
+                        onChange={(e) => setSelectedAudioTrack(Number(e.target.value))}
+                        disabled={isProbingTracks}
+                        className="audio-track-selector-dropdown"
+                      >
+                        {audioTracks.map((track) => (
+                          <option key={track.index} value={track.index}>
+                            {getAudioTrackLabel(track)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
                   <div className="engine-field">
                     <label>Source Language</label>
                     <select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}>
@@ -1415,7 +1492,7 @@ const SubtitleGenerator = () => {
             <div className="extract-panel-card">
               <div className="panel-header">
                 <h3>⚡ Direct Fast Audio Extraction</h3>
-                <p>Extract uncompressed/high-quality audio from any local video file without uploading over HTTP.</p>
+                <p>Extract uncompressed/high-quality audio from any specific audio track of your movie without uploading over HTTP.</p>
               </div>
 
               <div className="path-input-group">
@@ -1433,6 +1510,23 @@ const SubtitleGenerator = () => {
                 </div>
               </div>
 
+              {audioTracks && audioTracks.length > 0 && (
+                <div className="path-input-group">
+                  <label>🎵 Select Movie Audio Track ({audioTracks.length} Tracks Available)</label>
+                  <select
+                    value={selectedAudioTrack}
+                    onChange={(e) => setSelectedAudioTrack(Number(e.target.value))}
+                    className="audio-track-selector-dropdown"
+                  >
+                    {audioTracks.map((track) => (
+                      <option key={track.index} value={track.index}>
+                        {getAudioTrackLabel(track)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
               <div className="extract-actions-bar">
                 <button
                   type="button"
@@ -1440,7 +1534,7 @@ const SubtitleGenerator = () => {
                   onClick={handleExtractAudio}
                   disabled={extracting || (!videoPath.trim() && !file && !localVideoFile)}
                 >
-                  {extracting ? '⏳ Extracting Audio...' : '⚡ Extract Audio Track'}
+                  {extracting ? '⏳ Extracting Audio...' : '⚡ Extract Selected Audio Track'}
                 </button>
               </div>
 
@@ -1454,7 +1548,7 @@ const SubtitleGenerator = () => {
 
                   <div className="extract-btn-group">
                     <button type="button" className="studio-btn secondary" onClick={() => downloadExtractedAudio(extractResult)}>
-                      📥 Download Audio (.WAV)
+                      📥 Download Audio (.MP3)
                     </button>
                     <button
                       type="button"

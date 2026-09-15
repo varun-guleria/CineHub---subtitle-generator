@@ -725,7 +725,7 @@ async function prepareAudioForGroq(filePath, audioTrackIndex = 0) {
   }
 }
 
-async function extractAudioFromVideo(videoPath) {
+async function extractAudioFromVideo(videoPath, audioTrackIndex = 0) {
   if (!ffmpegPath) {
     throw new Error('ffmpeg binary is not available. Run npm install in the backend folder.')
   }
@@ -754,6 +754,7 @@ async function extractAudioFromVideo(videoPath) {
   await execFileAsync(ffmpegPath, [
     '-y',
     '-i', cleanedPath,
+    '-map', `0:a:${Math.max(0, Number(audioTrackIndex) || 0)}?`,
     '-vn',
     '-ac', '1',
     '-ar', TARGET_AUDIO_SAMPLE_RATE,
@@ -1168,19 +1169,19 @@ function shouldExtractAudio(file) {
   return mimeType.startsWith('video/') || ['.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.webm'].includes(extension)
 }
 
-async function generateSubtitlesForAudio(file, sourceLanguage, targetLanguage, translationModel = GROQ_TRANSLATION_MODEL, fallbackTranslationModel = GROQ_TRANSLATION_MODEL_ALT) {
+async function generateSubtitlesForAudio(file, sourceLanguage, targetLanguage, translationModel = GROQ_TRANSLATION_MODEL, fallbackTranslationModel = GROQ_TRANSLATION_MODEL_ALT, audioTrackIndex = 0) {
   if (file.size <= GROQ_MAX_AUDIO_BYTES && !shouldExtractAudio(file)) {
     const transcription = await transcribeAudio(file.path, sourceLanguage)
     return formatSubtitles(transcription, targetLanguage, sourceLanguage, 0, translationModel, fallbackTranslationModel)
   }
 
   const preparationReason = shouldExtractAudio(file) ? 'Video upload detected' : 'Large file detected'
-  console.log(`${preparationReason} (${(file.size / 1024 / 1024).toFixed(2)}MB). Preparing compact audio...`)
+  console.log(`${preparationReason} (${(file.size / 1024 / 1024).toFixed(2)}MB). Preparing compact audio (Track ${audioTrackIndex})...`)
 
   let preparedDir
   let chunkDir
   try {
-    const preparedAudio = await prepareAudioForGroq(file.path)
+    const preparedAudio = await prepareAudioForGroq(file.path, audioTrackIndex)
     preparedDir = preparedAudio.dir
     console.log(`Prepared audio size: ${(preparedAudio.size / 1024 / 1024).toFixed(2)}MB`)
 
@@ -1505,10 +1506,9 @@ app.post('/extract-audio', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Please select a supported video file: MP4, MKV, MOV, M4V, MPEG, MPG, or WEBM' })
     }
 
-    // A browser cannot expose the user's original Windows path. When Browse
-    // supplies a File, multer stores a temporary local copy for ffmpeg.
     const inputPath = req.file?.path || req.body?.videoPath
-    const extractedAudio = await extractAudioFromVideo(inputPath)
+    const audioTrackIndex = req.body?.audioTrack ?? 0
+    const extractedAudio = await extractAudioFromVideo(inputPath, audioTrackIndex)
     const audioFileName = path.basename(extractedAudio.outputPath)
 
     res.json({
@@ -1525,8 +1525,6 @@ app.post('/extract-audio', upload.single('file'), async (req, res) => {
     if (uploadedFilePath) removeUploadedFile(uploadedFilePath)
   }
 })
-
-
 
 app.get('/download-extracted-audio/:audioName', (req, res) => {
   const audioName = path.basename(req.params.audioName)
@@ -1569,7 +1567,8 @@ app.post('/generate-subtitles', upload.single('file'), async (req, res) => {
     const {
       sourceLanguage = 'auto',
       targetLanguage = 'en',
-      translationModel = GROQ_TRANSLATION_MODEL
+      translationModel = GROQ_TRANSLATION_MODEL,
+      audioTrack = 0
     } = req.body
 
     // Validate languages
@@ -1601,14 +1600,15 @@ app.post('/generate-subtitles', upload.single('file'), async (req, res) => {
       return res.status(500).json({ error: 'Groq API key not configured' })
     }
 
-    console.log(`Processing: ${file.originalname || file.path} - Source: ${sourceLanguage}, Target: ${targetLanguage}, Model: ${translationModel}`)
+    console.log(`Processing: ${file.originalname || file.path} - Track: ${audioTrack} - Source: ${sourceLanguage}, Target: ${targetLanguage}, Model: ${translationModel}`)
 
     const subtitles = await generateSubtitlesForAudio(
       file,
       sourceLanguage === 'auto' ? undefined : sourceLanguage,
       targetLanguage,
       translationModel,
-      fallbackTranslationModel
+      fallbackTranslationModel,
+      Number(audioTrack) || 0
     )
 
     // Clean up uploaded file if it was uploaded
