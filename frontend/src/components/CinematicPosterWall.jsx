@@ -260,7 +260,7 @@ const CinematicPosterWall = () => {
             Cine<span>Hub</span>
           </h1>
           <p className="hero-editorial-tagline">
-            Real-time AI Subtitle Synthesis & Translation
+            Real-time Subtitle Synthesis & Translation
           </p>
         </div>
 

@@ -1,14 +1,33 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useMemo } from 'react'
 import axios from 'axios'
 import './SubtitleGenerator.css'
 
 const formatTime = (seconds, format = 'srt') => {
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const secs = Math.floor(seconds % 60)
-  const ms = Math.floor((seconds % 1) * 1000)
+  const num = Number(seconds)
+  if (!Number.isFinite(num) || num < 0) return format === 'vtt' ? '00:00:00.000' : '00:00:00,000'
+  const hours = Math.floor(num / 3600)
+  const minutes = Math.floor((num % 3600) / 60)
+  const secs = Math.floor(num % 60)
+  const ms = Math.floor((num % 1) * 1000)
   const sep = format === 'vtt' ? '.' : ','
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}${sep}${String(ms).padStart(3, '0')}`
+}
+
+const parseTimeToSeconds = (str) => {
+  if (!str) return 0
+  const normalized = str.trim().replace(',', '.')
+  const parts = normalized.split(':')
+  if (parts.length === 3) {
+    const h = parseFloat(parts[0]) || 0
+    const m = parseFloat(parts[1]) || 0
+    const s = parseFloat(parts[2]) || 0
+    return h * 3600 + m * 60 + s
+  } else if (parts.length === 2) {
+    const m = parseFloat(parts[0]) || 0
+    const s = parseFloat(parts[1]) || 0
+    return m * 60 + s
+  }
+  return parseFloat(normalized) || 0
 }
 
 const mergeSubtitles = (existing = [], incoming = []) => {
@@ -18,7 +37,7 @@ const mergeSubtitles = (existing = [], incoming = []) => {
     const end = Number(subtitle?.end)
     const text = String(subtitle?.text || '').trim()
     if (!Number.isFinite(start) || !Number.isFinite(end) || !text) continue
-    unique.set(`${start}|${end}|${text}`, { start, end, text })
+    unique.set(`${start.toFixed(3)}|${end.toFixed(3)}|${text}`, { start, end, text })
   }
   return [...unique.values()].sort((a, b) => a.start - b.start || a.end - b.end)
 }
@@ -41,16 +60,16 @@ const audioLanguageNames = {
   und: 'Unknown language'
 }
 
-const getAudioTrackLabel = (track) => {
-  const language = audioLanguageNames[String(track?.language || 'und').toLowerCase()] || track?.language || 'Unknown language'
-  const details = [track?.codec, track?.isDefault ? 'Default' : null].filter(Boolean).join(' · ')
-  return details ? `${language} (${details})` : language
-}
-
 const SubtitleGenerator = () => {
+  // Media & State
   const [file, setFile] = useState(null)
   const [mediaUrl, setMediaUrl] = useState(null)
   const [currentTime, setCurrentTime] = useState(0)
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0)
+  const [aspectRatio, setAspectRatio] = useState('16:9') // '16:9', '9:16', '1:1'
+  const [subtitleStyle, setSubtitleStyle] = useState('standard') // 'standard', 'yellow', 'boxed'
+
   const [sourceLanguage, setSourceLanguage] = useState('auto')
   const [targetLanguage, setTargetLanguage] = useState('en')
   const [videoPath, setVideoPath] = useState('')
@@ -62,10 +81,12 @@ const SubtitleGenerator = () => {
   const [error, setError] = useState(null)
   const [extractError, setExtractError] = useState(null)
   const [useExtractedError, setUseExtractedError] = useState(null)
+
   const [translationModels, setTranslationModels] = useState([])
   const [translationModel, setTranslationModel] = useState('')
   const [modelLoading, setModelLoading] = useState(true)
   const [modelError, setModelError] = useState(null)
+
   const [localVideoFile, setLocalVideoFile] = useState(null)
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamBuffering, setStreamBuffering] = useState(false)
@@ -78,19 +99,23 @@ const SubtitleGenerator = () => {
   const [localVideoDetails, setLocalVideoDetails] = useState(null)
   const [selectedVideoName, setSelectedVideoName] = useState('')
   const [subtitleSessionId, setSubtitleSessionId] = useState(null)
-  const [preparedStream, setPreparedStream] = useState(null)
-  const [isPreparingStream, setIsPreparingStream] = useState(false)
-  const [audioTracks, setAudioTracks] = useState([])
-  const [selectedAudioTrack, setSelectedAudioTrack] = useState(0)
   const [isBrowsing, setIsBrowsing] = useState(false)
 
+  // Editor Filter & View Options
+  const [searchQuery, setSearchQuery] = useState('')
+  const [activeTab, setActiveTab] = useState('editor') // 'editor', 'extract', 'settings'
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [editingSegmentIndex, setEditingSegmentIndex] = useState(null)
+
+  // Refs
   const fileInputRef = useRef(null)
   const localVideoInputRef = useRef(null)
   const mediaRef = useRef(null)
   const videoWrapperRef = useRef(null)
+  const activeSubtitleRef = useRef(null)
+  const subtitleListRef = useRef(null)
   const abortControllerRef = useRef(null)
   const stopRequestedRef = useRef(false)
-  const shouldFocusPreviewRef = useRef(false)
 
   const languages = [
     { code: 'auto', name: 'Auto Detect' },
@@ -110,63 +135,38 @@ const SubtitleGenerator = () => {
   ]
 
   const supportedMediaExtensions = [
-    '.aac',
-    '.aiff',
-    '.avi',
-    '.flac',
-    '.m4a',
-    '.m4v',
-    '.mkv',
-    '.mov',
-    '.mp3',
-    '.mp4',
-    '.mpeg',
-    '.mpg',
-    '.ogg',
-    '.wav',
-    '.webm',
-    '.wma',
+    '.aac', '.aiff', '.avi', '.flac', '.m4a', '.m4v', '.mkv',
+    '.mov', '.mp3', '.mp4', '.mpeg', '.mpg', '.ogg', '.wav', '.webm', '.wma'
   ]
 
   const supportedVideoExtensions = [
-    '.avi',
-    '.m4v',
-    '.mkv',
-    '.mov',
-    '.mp4',
-    '.mpeg',
-    '.mpg',
-    '.webm',
+    '.avi', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.webm'
   ]
 
   const isSupportedVideoPath = (path) => {
     if (!path || typeof path !== 'string') return false
     const lower = path.trim().toLowerCase()
-    return supportedVideoExtensions.some((extension) => lower.endsWith(extension))
+    return supportedVideoExtensions.some((ext) => lower.endsWith(ext))
   }
 
   const isSupportedMediaFile = (selectedFile) => {
     if (!selectedFile) return false
-
     const mimeType = selectedFile.type || ''
     const fileName = selectedFile.name.toLowerCase()
-
     return (
       mimeType.startsWith('audio/') ||
       mimeType.startsWith('video/') ||
-      supportedMediaExtensions.some((extension) => fileName.endsWith(extension))
+      supportedMediaExtensions.some((ext) => fileName.endsWith(ext))
     )
   }
 
   const isVideoFile = (selectedFile) => {
     if (!selectedFile) return false
-
     const mimeType = selectedFile.type || ''
     const fileName = selectedFile.name.toLowerCase()
-
     return (
       mimeType.startsWith('video/') ||
-      supportedVideoExtensions.some((extension) => fileName.endsWith(extension))
+      supportedVideoExtensions.some((ext) => fileName.endsWith(ext))
     )
   }
 
@@ -185,17 +185,13 @@ const SubtitleGenerator = () => {
     if (localVideoFile && isVideoFile(localVideoFile)) {
       const url = URL.createObjectURL(localVideoFile)
       setMediaUrl(url)
-      return () => {
-        URL.revokeObjectURL(url)
-      }
+      return () => URL.revokeObjectURL(url)
     }
 
     if (file) {
       const url = URL.createObjectURL(file)
       setMediaUrl(url)
-      return () => {
-        URL.revokeObjectURL(url)
-      }
+      return () => URL.revokeObjectURL(url)
     }
 
     setMediaUrl(null)
@@ -241,10 +237,41 @@ const SubtitleGenerator = () => {
     const url = URL.createObjectURL(blob)
     setVttUrl(url)
 
-    return () => {
-      URL.revokeObjectURL(url)
-    }
+    return () => URL.revokeObjectURL(url)
   }, [subtitles])
+
+  // Keyboard Navigation & Studio Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Don't trigger hotkeys if typing in input/textarea/select
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+        return
+      }
+
+      if (e.code === 'Space' && mediaRef.current) {
+        e.preventDefault()
+        togglePlayPause()
+      } else if (e.key === 'ArrowLeft' && mediaRef.current) {
+        e.preventDefault()
+        seekRelative(-5)
+      } else if (e.key === 'ArrowRight' && mediaRef.current) {
+        e.preventDefault()
+        seekRelative(5)
+      } else if (e.key === ',' && mediaRef.current) {
+        e.preventDefault()
+        seekRelative(-0.04) // Frame back
+      } else if (e.key === '.' && mediaRef.current) {
+        e.preventDefault()
+        seekRelative(0.04) // Frame forward
+      } else if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        e.preventDefault()
+        setShowShortcuts((prev) => !prev)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [mediaUrl, isPlaying])
 
   const handleMediaMetadata = () => {
     if (mediaRef.current && mediaRef.current.duration) {
@@ -256,11 +283,32 @@ const SubtitleGenerator = () => {
     if (mediaRef.current) {
       mediaRef.current.muted = false
       mediaRef.current.volume = 1.0
+      setIsPlaying(true)
     }
   }
 
-  const handleMediaPlaybackError = () => {
-    console.warn('Media element encountered a playback error.')
+  const togglePlayPause = () => {
+    if (!mediaRef.current) return
+    if (mediaRef.current.paused) {
+      mediaRef.current.play().then(() => setIsPlaying(true)).catch(() => {})
+    } else {
+      mediaRef.current.pause()
+      setIsPlaying(false)
+    }
+  }
+
+  const seekRelative = (seconds) => {
+    if (!mediaRef.current) return
+    const newTime = Math.max(0, Math.min(totalDuration || Infinity, mediaRef.current.currentTime + seconds))
+    mediaRef.current.currentTime = newTime
+    setCurrentTime(newTime)
+  }
+
+  const handlePlaybackSpeedChange = (speed) => {
+    setPlaybackSpeed(speed)
+    if (mediaRef.current) {
+      mediaRef.current.playbackRate = speed
+    }
   }
 
   const handleToggleFullscreen = () => {
@@ -285,18 +333,11 @@ const SubtitleGenerator = () => {
     const handleFullscreenChange = () => {
       const active = Boolean(document.fullscreenElement)
       setIsFullscreen(active)
-
-      if (active && document.fullscreenElement === mediaRef.current) {
-        setIsDirectVideoFullscreen(true)
-      } else {
-        setIsDirectVideoFullscreen(false)
-      }
+      setIsDirectVideoFullscreen(active && document.fullscreenElement === mediaRef.current)
     }
 
     document.addEventListener('fullscreenchange', handleFullscreenChange)
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange)
-    }
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
   const handleFileSelect = (e) => {
@@ -475,7 +516,7 @@ const SubtitleGenerator = () => {
   }
 
   const handleSubmit = async (e) => {
-    e.preventDefault()
+    if (e) e.preventDefault()
 
     if (!file && !localVideoFile && !videoPath.trim()) {
       setError('Please select an audio/video file or enter a local video path.')
@@ -504,9 +545,7 @@ const SubtitleGenerator = () => {
         formData.append('model', translationModel)
 
         response = await axios.post('/api/generate-subtitles', formData, {
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
+          headers: { 'Content-Type': 'multipart/form-data' },
         })
       }
 
@@ -548,9 +587,7 @@ const SubtitleGenerator = () => {
       if (videoPath.trim()) {
         response = await fetch('/api/stream-subtitles-path', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             videoPath: videoPath.trim(),
             sourceLanguage,
@@ -630,16 +667,10 @@ const SubtitleGenerator = () => {
               }
             } else if (eventType === 'subtitles') {
               if (Array.isArray(parsed.subtitles) && parsed.subtitles.length > 0) {
-                setSubtitles((prev) => {
-                  return mergeSubtitles(prev || [], parsed.subtitles)
-                })
+                setSubtitles((prev) => mergeSubtitles(prev || [], parsed.subtitles))
               }
-              if (parsed.sessionId) {
-                setSubtitleSessionId(parsed.sessionId)
-              }
-              if (typeof parsed.bufferedUntil === 'number') {
-                setBufferedUntil(parsed.bufferedUntil)
-              }
+              if (parsed.sessionId) setSubtitleSessionId(parsed.sessionId)
+              if (typeof parsed.bufferedUntil === 'number') setBufferedUntil(parsed.bufferedUntil)
 
               if (parsed.initialBufferReady) {
                 setStreamBuffering(false)
@@ -648,7 +679,7 @@ const SubtitleGenerator = () => {
                   mediaRef.current.play().catch(() => {})
                 }
               } else {
-                setStreamingStatus(`Generating the next subtitle chunk in the background. Buffered through ${formatTime(parsed.bufferedUntil)}`)
+                setStreamingStatus(`Generating next subtitle chunk... Buffered through ${formatTime(parsed.bufferedUntil)}`)
               }
             } else if (eventType === 'done') {
               setStreamingStatus('Complete! All subtitles generated.')
@@ -678,22 +709,12 @@ const SubtitleGenerator = () => {
         setStreamingStatus('Live subtitle stream stopped.')
         setError(null)
       } else {
-        const isConnectionFailure =
-          err instanceof TypeError ||
-          String(err.message || '').toLowerCase().includes('failed to fetch') ||
-          String(err.message || '').toLowerCase().includes('network')
-        setError(
-          isConnectionFailure
-            ? 'Cannot reach the subtitle server. Start both apps with "npm run dev" from the project folder, then try again.'
-            : err.message || 'Failed to stream subtitles'
-        )
+        setError(err.message || 'Failed to stream subtitles')
         console.error('Streaming error:', err)
       }
     } finally {
       if (reader) {
-        try {
-          await reader.cancel()
-        } catch {}
+        try { await reader.cancel() } catch {}
       }
       setIsStreaming(false)
       setStreamBuffering(false)
@@ -725,7 +746,7 @@ const SubtitleGenerator = () => {
     if (format === 'srt' && subtitleSessionId) {
       const element = document.createElement('a')
       element.href = `/api/subtitle-sessions/${encodeURIComponent(subtitleSessionId)}/srt`
-      element.setAttribute('download', 'subtitles.srt')
+      element.setAttribute('download', `${selectedVideoName || 'subtitles'}.srt`)
       element.style.display = 'none'
       document.body.appendChild(element)
       element.click()
@@ -734,7 +755,7 @@ const SubtitleGenerator = () => {
     }
 
     let content = ''
-    let filename = `subtitles.${format}`
+    let filename = `${selectedVideoName || 'subtitles'}.${format}`
 
     if (format === 'srt') {
       subtitles.forEach((item, index) => {
@@ -748,7 +769,11 @@ const SubtitleGenerator = () => {
         content += `${formatTime(item.start, 'vtt')} --> ${formatTime(item.end, 'vtt')}\n`
         content += `${item.text}\n\n`
       })
-      filename = `subtitles.vtt`
+    } else if (format === 'txt') {
+      subtitles.forEach((item) => {
+        content += `${item.text}\n`
+      })
+      filename = `${selectedVideoName || 'transcript'}.txt`
     }
 
     const element = document.createElement('a')
@@ -763,8 +788,35 @@ const SubtitleGenerator = () => {
   const handleSeek = (startTime) => {
     if (mediaRef.current) {
       mediaRef.current.currentTime = startTime
-      mediaRef.current.play().catch(() => {})
+      setCurrentTime(startTime)
+      mediaRef.current.play().then(() => setIsPlaying(true)).catch(() => {})
     }
+  }
+
+  const handleUpdateSubtitleText = (index, newText) => {
+    setSubtitles((prev) => {
+      if (!prev) return prev
+      const updated = [...prev]
+      updated[index] = { ...updated[index], text: newText }
+      return updated
+    })
+  }
+
+  const handleUpdateSubtitleTime = (index, field, value) => {
+    const seconds = parseTimeToSeconds(value)
+    setSubtitles((prev) => {
+      if (!prev) return prev
+      const updated = [...prev]
+      updated[index] = { ...updated[index], [field]: seconds }
+      return updated.sort((a, b) => a.start - b.start)
+    })
+  }
+
+  const handleDeleteSegment = (index) => {
+    setSubtitles((prev) => {
+      if (!prev) return prev
+      return prev.filter((_, i) => i !== index)
+    })
   }
 
   const handleReset = () => {
@@ -796,84 +848,188 @@ const SubtitleGenerator = () => {
     (sub) => currentTime >= sub.start && currentTime <= sub.end
   )
 
+  // Filtered Subtitles for Search
+  const filteredSubtitles = useMemo(() => {
+    if (!subtitles) return []
+    if (!searchQuery.trim()) return subtitles
+    const q = searchQuery.toLowerCase()
+    return subtitles.filter(
+      (sub) =>
+        sub.text.toLowerCase().includes(q) ||
+        formatTime(sub.start).includes(q) ||
+        formatTime(sub.end).includes(q)
+    )
+  }, [subtitles, searchQuery])
+
+  // Scroll active subtitle into view
+  useEffect(() => {
+    if (activeSubtitle && activeSubtitleRef.current && subtitleListRef.current) {
+      activeSubtitleRef.current.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+      })
+    }
+  }, [activeSubtitle])
+
   return (
-    <div className="subtitle-generator">
-      <div className="container">
-        <div className="header full-width-header">
-          <div className="header-left">
-            <div className="header-brand-badge">
-              <span className="badge-pulse"></span>
-              <span className="badge-text">AI Subtitle Studio</span>
-            </div>
-            <div className="header-title-row">
-              <div className="brand-logo-mark" aria-hidden="true">
-                <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
-                  <rect x="1" y="1" width="34" height="34" rx="10" stroke="url(#cinesub-border)" strokeWidth="1.5" fill="rgba(0, 212, 160, 0.08)" />
-                  <path d="M11 12H25C26.1 12 27 12.9 27 14V22C27 23.1 26.1 24 25 24H11C9.9 24 9 23.1 9 22V14C9 12.9 9.9 12 11 12Z" stroke="#00d4a0" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
-                  <path d="M13 17H18M13 20.5H23" stroke="#f2f2f2" strokeWidth="1.75" strokeLinecap="round"/>
-                  <circle cx="22" cy="15.5" r="1.5" fill="#00d4a0"/>
-                  <defs>
-                    <linearGradient id="cinesub-border" x1="0" y1="0" x2="36" y2="36" gradientUnits="userSpaceOnUse">
-                      <stop stopColor="#00d4a0" stopOpacity="0.8"/>
-                      <stop offset="1" stopColor="#00d4a0" stopOpacity="0.2"/>
-                    </linearGradient>
-                  </defs>
-                </svg>
-              </div>
-              <h1 className="brand-title">
-                <span className="brand-cine">Cine</span><span className="brand-sub">Hub</span>
-                <span className="brand-glow-dot"></span>
-              </h1>
-            </div>
-            <p className="header-tagline">
-              Transform video or audio into multilingual subtitles with cinematic AI precision
-            </p>
+    <div className="subtitle-generator studio-workspace">
+      {/* ───────────────────────────────────────────────────────────
+         STUDIO COMMAND BAR (Compact Top App Bar)
+         ─────────────────────────────────────────────────────────── */}
+      <header className="studio-topbar">
+        <div className="topbar-left">
+          <div className="studio-brand-mark">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <path d="M8 21h8M12 17v4" />
+              <path d="M7 10h5M7 13h10" stroke="#00d4a0" />
+            </svg>
+            <span className="studio-brand-name">CineHub Studio</span>
           </div>
-          <div className="header-right-badges">
-            <div className="studio-pill">
-              <span className="studio-pill-dot green"></span>
-              <span>Whisper Engine</span>
-            </div>
-            <div className="studio-pill">
-              <span className="studio-pill-dot cyan"></span>
-              <span>Live Sync</span>
-            </div>
-            <div className="studio-pill">
-              <span className="studio-pill-dot amber"></span>
-              <span>Multilingual</span>
-            </div>
+
+          <div className="topbar-divider" />
+
+          <div className="topbar-media-spec">
+            <span className={`spec-dot ${mediaUrl ? 'active' : ''}`} />
+            <span className="spec-filename" title={selectedVideoName || 'No media loaded'}>
+              {selectedVideoName || (videoPath ? videoPath.split(/[\/\\]/).pop() : 'No Media File Loaded')}
+            </span>
+            {totalDuration > 0 && (
+              <span className="spec-duration">{formatTime(totalDuration)}</span>
+            )}
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="generator-form full-width-workspace">
-          <div className="studio-workspace-grid">
-            {/* Left Column: Theatre Media Stage & Source Ingestion */}
-            <div className="stage-media-column">
-              {/* Media Preview Player (if loaded) */}
-              {mediaUrl && (
-                <div className="media-preview-container">
-                  <div className="media-preview-header">
-                    <h3>Media Preview Player</h3>
-                    <div className="media-preview-header-actions">
-                      {isStreaming && (
-                        <div className="live-stream-badge">
-                          <span className="live-stream-dot"></span>
-                          {streamBuffering ? 'Buffering Initial Subtitles...' : 'Live Subtitles Streaming'}
-                        </div>
-                      )}
-                      {isCurrentMediaVideo && (
-                        <button
-                          type="button"
-                          className="fullscreen-toggle-btn"
-                          onClick={handleToggleFullscreen}
-                          title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
-                        >
-                          {isFullscreen ? '🗗 Exit Fullscreen' : '⛶ Fullscreen'}
-                        </button>
-                      )}
-                    </div>
+        <div className="topbar-center">
+          <div className="topbar-mode-switcher">
+            <button
+              type="button"
+              className={`mode-btn ${activeTab === 'editor' ? 'active' : ''}`}
+              onClick={() => setActiveTab('editor')}
+            >
+              <span>🎬 Studio Editor</span>
+            </button>
+            <button
+              type="button"
+              className={`mode-btn ${activeTab === 'extract' ? 'active' : ''}`}
+              onClick={() => setActiveTab('extract')}
+            >
+              <span>⚡ Audio Extract</span>
+            </button>
+            <button
+              type="button"
+              className={`mode-btn ${activeTab === 'settings' ? 'active' : ''}`}
+              onClick={() => setActiveTab('settings')}
+            >
+              <span>⚙ Settings</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="topbar-right">
+          {subtitles && subtitles.length > 0 && (
+            <div className="topbar-export-group">
+              <button
+                type="button"
+                className="topbar-btn secondary"
+                onClick={() => downloadSubtitles('srt')}
+                title="Export SRT Format"
+              >
+                Export .SRT
+              </button>
+              <button
+                type="button"
+                className="topbar-btn secondary"
+                onClick={() => downloadSubtitles('vtt')}
+                title="Export VTT Format"
+              >
+                Export .VTT
+              </button>
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="topbar-icon-btn"
+            onClick={() => setShowShortcuts(true)}
+            title="Keyboard Shortcuts (?)"
+          >
+            ⌨ Hotkeys
+          </button>
+        </div>
+      </header>
+
+      {/* ───────────────────────────────────────────────────────────
+         STUDIO MAIN WORKBENCH GRID
+         ─────────────────────────────────────────────────────────── */}
+      <main className="studio-workbench">
+        {activeTab === 'editor' && (
+          <div className="workbench-editor-layout">
+            {/* Left Pane: Media Monitor Stage */}
+            <section className="workbench-stage-pane">
+              <div className="stage-header">
+                <div className="stage-title">
+                  <span className="stage-badge">MONITOR</span>
+                  <h3>Video Preview Stage</h3>
+                </div>
+                <div className="stage-controls-mini">
+                  {/* Aspect Ratio Toggle */}
+                  <div className="mini-segmented">
+                    <button
+                      type="button"
+                      className={aspectRatio === '16:9' ? 'active' : ''}
+                      onClick={() => setAspectRatio('16:9')}
+                      title="Landscape 16:9"
+                    >
+                      16:9
+                    </button>
+                    <button
+                      type="button"
+                      className={aspectRatio === '9:16' ? 'active' : ''}
+                      onClick={() => setAspectRatio('9:16')}
+                      title="Shorts/Reels 9:16"
+                    >
+                      9:16
+                    </button>
+                    <button
+                      type="button"
+                      className={aspectRatio === '1:1' ? 'active' : ''}
+                      onClick={() => setAspectRatio('1:1')}
+                      title="Square 1:1"
+                    >
+                      1:1
+                    </button>
                   </div>
-                  {isCurrentMediaVideo ? (
+
+                  {/* Subtitle Style Switcher */}
+                  <select
+                    className="mini-select"
+                    value={subtitleStyle}
+                    onChange={(e) => setSubtitleStyle(e.target.value)}
+                    title="Overlay Subtitle Style"
+                  >
+                    <option value="standard">Standard Subtitle</option>
+                    <option value="yellow">Cinema Yellow</option>
+                    <option value="boxed">Solid Dark Box</option>
+                  </select>
+
+                  {isCurrentMediaVideo && (
+                    <button
+                      type="button"
+                      className="stage-fullscreen-btn"
+                      onClick={handleToggleFullscreen}
+                      title="Fullscreen (F)"
+                    >
+                      ⛶
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Video Player Display Container */}
+              <div className={`video-stage-viewport aspect-${aspectRatio}`}>
+                {mediaUrl ? (
+                  isCurrentMediaVideo ? (
                     <div ref={videoWrapperRef} className="video-player-wrapper">
                       <video
                         ref={mediaRef}
@@ -882,104 +1038,62 @@ const SubtitleGenerator = () => {
                         crossOrigin="anonymous"
                         onLoadedMetadata={handleMediaMetadata}
                         onPlay={makeMediaAudible}
-                        onError={handleMediaPlaybackError}
+                        onPause={() => setIsPlaying(false)}
                         onTimeUpdate={() => setCurrentTime(mediaRef.current?.currentTime || 0)}
                         onDoubleClick={handleToggleFullscreen}
-                        className="media-player"
+                        className="media-player video-player"
                       >
                         {vttUrl && (
                           <track
                             key={vttUrl}
                             kind="subtitles"
-                            label="Live Subtitles"
+                            label="Studio Subtitles"
                             src={vttUrl}
                             default
-                            onLoad={handleTrackLoad}
                           />
                         )}
                       </video>
+
+                      {/* Studio Interactive Subtitle Overlay */}
                       {activeSubtitle && !isDirectVideoFullscreen && (
-                        <div className="video-subtitle-overlay">
+                        <div className={`studio-subtitle-overlay style-${subtitleStyle}`}>
                           <span>{activeSubtitle.text}</span>
                         </div>
                       )}
-                      {isFullscreen && (
-                        <button
-                          type="button"
-                          className="floating-fullscreen-exit-btn"
-                          onClick={handleToggleFullscreen}
-                          title="Exit Fullscreen (Esc)"
-                        >
-                          ✕ Exit Fullscreen
-                        </button>
-                      )}
                     </div>
                   ) : (
-                    <audio
-                      ref={mediaRef}
-                      src={mediaUrl}
-                      controls
-                      onLoadedMetadata={handleMediaMetadata}
-                      onPlay={makeMediaAudible}
-                      onError={handleMediaPlaybackError}
-                      onTimeUpdate={() => setCurrentTime(mediaRef.current?.currentTime || 0)}
-                      className="media-player audio-player"
-                    />
-                  )}
-
-                  {/* Live Subtitle Buffer Progress Bar */}
-                  {(isStreaming || bufferedUntil > 0) && (
-                    <div className="stream-buffer-panel">
-                      <div className="stream-buffer-meta">
-                        <div className="stream-buffer-status">
-                          <span className="stream-buffer-icon">{isStreaming ? '⚡' : '✓'}</span>
-                          <span className="stream-buffer-text">
-                            {streamingStatus || `Subtitles buffered through ${formatTime(bufferedUntil)}`}
-                          </span>
+                    <div className="audio-stage-wrapper">
+                      <div className="audio-waveform-visualizer">
+                        <div className="waveform-bar" style={{ height: '40%' }}></div>
+                        <div className="waveform-bar" style={{ height: '70%' }}></div>
+                        <div className="waveform-bar" style={{ height: '100%' }}></div>
+                        <div className="waveform-bar" style={{ height: '60%' }}></div>
+                        <div className="waveform-bar" style={{ height: '85%' }}></div>
+                        <div className="waveform-bar" style={{ height: '30%' }}></div>
+                        <div className="waveform-bar" style={{ height: '90%' }}></div>
+                      </div>
+                      <audio
+                        ref={mediaRef}
+                        src={mediaUrl}
+                        controls
+                        onLoadedMetadata={handleMediaMetadata}
+                        onPlay={makeMediaAudible}
+                        onPause={() => setIsPlaying(false)}
+                        onTimeUpdate={() => setCurrentTime(mediaRef.current?.currentTime || 0)}
+                        className="media-player audio-player"
+                      />
+                      {activeSubtitle && (
+                        <div className={`studio-subtitle-overlay style-${subtitleStyle}`}>
+                          <span>{activeSubtitle.text}</span>
                         </div>
-                        <span className="stream-buffer-time">
-                          Playback: {formatTime(currentTime)} / Subtitles: {formatTime(bufferedUntil)}
-                        </span>
-                      </div>
-                      <div className="stream-buffer-track">
-                        <div
-                          className="stream-buffer-fill"
-                          style={{
-                            width: totalDuration > 0
-                              ? `${Math.min(100, Math.round((bufferedUntil / totalDuration) * 100))}%`
-                              : bufferedUntil > 0 ? '100%' : '20%'
-                          }}
-                          title={`Buffered until ${formatTime(bufferedUntil)}`}
-                        />
-                        <div
-                          className="stream-playback-marker"
-                          style={{
-                            left: totalDuration > 0
-                              ? `${Math.min(100, Math.round((currentTime / totalDuration) * 100))}%`
-                              : '0%'
-                          }}
-                          title={`Current playback: ${formatTime(currentTime)}`}
-                        />
-                      </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              )}
-
-              {/* Source Ingestion Suite */}
-              <div className="media-ingest-suite">
-                {/* Upload Section */}
-                <div className="upload-section">
-                  <div
-                    className="upload-area"
-                    onDrop={handleDragDrop}
-                    onDragOver={(e) => {
-                      e.preventDefault()
-                      e.currentTarget.classList.add('drag-over')
-                    }}
-                    onDragLeave={(e) => e.currentTarget.classList.remove('drag-over')}
-                    onClick={() => fileInputRef.current.click()}
-                  >
+                  )
+                ) : (
+                  <div className="empty-stage-placeholder" onClick={() => fileInputRef.current?.click()}>
+                    <div className="empty-stage-icon">🎬</div>
+                    <h4>No Media File Loaded</h4>
+                    <p>Click to browse audio/video or drag and drop a file into the studio</p>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -987,326 +1101,434 @@ const SubtitleGenerator = () => {
                       onChange={handleFileSelect}
                       style={{ display: 'none' }}
                     />
-                    <div className="upload-icon">🎬</div>
-                    <div className="upload-text">
-                      {file ? (
-                        <>
-                          <p className="success">✓ {file.name}</p>
-                          <p className="file-size">
-                            {file.size > 1024 * 1024 * 1024
-                              ? `${(file.size / 1024 / 1024 / 1024).toFixed(2)} GB`
-                              : `${(file.size / 1024 / 1024).toFixed(2)} MB`}
-                          </p>
-                          <p className="subtitle">Media selected. Ready to play or generate subtitles.</p>
-                        </>
-                      ) : (
-                        <>
-                          <p>Drag & drop your audio or video file here</p>
-                          <p className="subtitle">or click to browse media</p>
-                        </>
-                      )}
-                    </div>
                   </div>
-                </div>
+                )}
+              </div>
 
-                {/* Local Video Path & Fast Disk Extraction */}
-                <div className="extract-section">
-                  <div className="extract-header">
-                    <div className="extract-header-title-row">
-                      <h2>Direct Disk / Fast Audio Extraction</h2>
-                      <span className="extract-badge">Fast I/O</span>
-                    </div>
-                    <p>Browse to play and generate subtitles, or paste a full local path to extract audio directly without upload overhead.</p>
+              {/* Studio Transport Control Deck */}
+              {mediaUrl && (
+                <div className="studio-transport-deck">
+                  <div className="transport-timecode-display">
+                    <span className="time-current">{formatTime(currentTime)}</span>
+                    <span className="time-separator">/</span>
+                    <span className="time-total">{formatTime(totalDuration)}</span>
                   </div>
 
-                  <div className="video-path-section">
-                    <label htmlFor="video-path">Video file or local path</label>
-                    <div className="path-picker-row">
-                      <input
-                        ref={localVideoInputRef}
-                        type="file"
-                        accept="video/*,.avi,.m4v,.mkv,.mov,.mp4,.mpeg,.mpg,.webm"
-                        onChange={handleLocalVideoPick}
-                        style={{ display: 'none' }}
-                      />
-                      <input
-                        id="video-path"
-                        type="text"
-                        value={videoPath}
-                        onChange={(e) => {
-                          setVideoPath(e.target.value)
-                          setFile(null)
-                          setLocalVideoFile(null)
-                          setLocalVideoDetails(null)
-                          setSelectedVideoName('')
-                        }}
-                        placeholder="Click Browse or paste a local file path…"
-                      />
-                      <button
-                        type="button"
-                        className="browse-button"
-                        onClick={handleBrowseLocalFile}
-                        disabled={isBrowsing}
-                        title={isBrowsing ? 'File browser is open — choose a file…' : 'Browse local files'}
-                      >
-                        {isBrowsing ? '⏳ Choosing file…' : '📂 Browse'}
-                      </button>
-                    </div>
-                    {selectedVideoName && (
-                      <p className="picked-file-hint">
-                        <strong>Selected video:</strong> {selectedVideoName} — ready to preview and generate subtitles.
-                      </p>
-                    )}
-                    {localVideoDetails ? (
-                      <p className="picked-file-hint">
-                        📁 <strong>{localVideoDetails.fileName}</strong> ({localVideoDetails.sizeGB >= 1 ? `${localVideoDetails.sizeGB} GB` : `${localVideoDetails.sizeMB} MB`}) — <span style={{ color: '#34d399', fontWeight: 600 }}>⚡ Local file selected (fast disk extraction, no upload needed)</span>
-                      </p>
-                    ) : null}
-                  </div>
-
-                  <div className="extract-actions">
+                  <div className="transport-center-controls">
                     <button
                       type="button"
-                      className="extract-button"
-                      onClick={handleExtractAudio}
-                      disabled={extracting || (!videoPath.trim() && !file && !localVideoFile)}
+                      className="transport-btn"
+                      onClick={() => seekRelative(-5)}
+                      title="Rewind 5s (←)"
                     >
-                      {extracting ? 'Extracting audio...' : 'Extract Audio Track'}
+                      ↺ 5s
+                    </button>
+                    <button
+                      type="button"
+                      className="transport-btn"
+                      onClick={() => seekRelative(-0.04)}
+                      title="Frame Back (,)"
+                    >
+                      ⏮ Frame
+                    </button>
+                    <button
+                      type="button"
+                      className="transport-btn play-btn"
+                      onClick={togglePlayPause}
+                      title="Play/Pause (Space)"
+                    >
+                      {isPlaying ? '⏸ Pause' : '▶ Play'}
+                    </button>
+                    <button
+                      type="button"
+                      className="transport-btn"
+                      onClick={() => seekRelative(0.04)}
+                      title="Frame Forward (.)"
+                    >
+                      Frame ⏭
+                    </button>
+                    <button
+                      type="button"
+                      className="transport-btn"
+                      onClick={() => seekRelative(5)}
+                      title="Forward 5s (→)"
+                    >
+                      5s ↻
                     </button>
                   </div>
 
-                  {extractError && <div className="error-message">{extractError}</div>}
-
-                  {extractResult && (
-                    <div className="extract-result">
-                      <p><strong>Audio extracted:</strong> {extractResult.audioFileName}</p>
-                      <p>Size: {extractResult.audioSizeMB} MB</p>
-                      <div className="extract-buttons-row">
-                        <button type="button" className="download-btn" onClick={() => downloadExtractedAudio(extractResult)}>
-                          Download Extracted Audio
-                        </button>
-                        <button
-                          type="button"
-                          className="download-btn"
-                          onClick={() => useExtractedAudioForSubtitles(extractResult)}
-                          disabled={useExtractedLoading}
-                        >
-                          {useExtractedLoading ? 'Generating...' : 'Generate Subtitles from Extracted Audio'}
-                        </button>
-                      </div>
-                      {useExtractedError && <div className="error-message">{useExtractedError}</div>}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Right Column: Studio Control Deck */}
-            <div className="stage-controls-column">
-              {/* Language & Model Selection */}
-              <div className="control-deck-card">
-                <div className="control-deck-card-header">
-                  <span className="control-deck-badge">STAGE 01</span>
-                  <h3>Translation & Model</h3>
-                </div>
-
-                <div className="language-section">
-                  <div className="language-group">
-                    <label htmlFor="source-lang">Source Language</label>
-                    <select
-                      id="source-lang"
-                      value={sourceLanguage}
-                      onChange={(e) => setSourceLanguage(e.target.value)}
-                    >
-                      {languages.map(lang => (
-                        <option key={lang.code} value={lang.code}>{lang.name}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="arrow">→</div>
-
-                  <div className="language-group">
-                    <label htmlFor="target-lang">Target Language</label>
-                    <select
-                      id="target-lang"
-                      value={targetLanguage}
-                      onChange={(e) => setTargetLanguage(e.target.value)}
-                    >
-                      {languages.filter(lang => lang.code !== 'auto').map(lang => (
-                        <option key={lang.code} value={lang.code}>{lang.name}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="language-group model-group">
-                    <label htmlFor="translation-model">Translation Model</label>
-                    {modelLoading ? (
-                      <p className="subtitle">Loading available models...</p>
-                    ) : modelError ? (
-                      <p className="error-message">{modelError}</p>
-                    ) : (
-                      <select
-                        id="translation-model"
-                        value={translationModel}
-                        onChange={(e) => setTranslationModel(e.target.value)}
+                  <div className="transport-speed-selector">
+                    <span className="speed-label">Speed:</span>
+                    {[0.5, 1.0, 1.25, 1.5, 2.0].map((rate) => (
+                      <button
+                        key={rate}
+                        type="button"
+                        className={`speed-btn ${playbackSpeed === rate ? 'active' : ''}`}
+                        onClick={() => handlePlaybackSpeedChange(rate)}
                       >
-                        {translationModels.map((model) => (
-                          <option key={model.value} value={model.value}>
-                            {model.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                        {rate}x
+                      </button>
+                    ))}
                   </div>
                 </div>
-              </div>
+              )}
 
-              {/* Action Buttons Group */}
-              <div className="control-deck-card action-deck-card">
-                <div className="control-deck-card-header">
-                  <span className="control-deck-badge">STAGE 02</span>
-                  <h3>Processing Engine</h3>
+              {/* Buffer Streaming Progress Bar */}
+              {(isStreaming || bufferedUntil > 0) && (
+                <div className="studio-buffer-bar">
+                  <div className="buffer-meta">
+                    <span className="buffer-status-badge">{isStreaming ? '⚡ STREAMING' : '✓ SYNCED'}</span>
+                    <span className="buffer-status-text">
+                      {streamingStatus || `Buffered through ${formatTime(bufferedUntil)}`}
+                    </span>
+                  </div>
+                  <div className="buffer-track-bg">
+                    <div
+                      className="buffer-fill"
+                      style={{
+                        width: totalDuration > 0
+                          ? `${Math.min(100, (bufferedUntil / totalDuration) * 100)}%`
+                          : '100%',
+                      }}
+                    />
+                    <div
+                      className="buffer-playhead"
+                      style={{
+                        left: totalDuration > 0
+                          ? `${Math.min(100, (currentTime / totalDuration) * 100)}%`
+                          : '0%',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Engine Trigger & Controls */}
+              <div className="studio-engine-dock">
+                <div className="engine-selectors">
+                  <div className="engine-field">
+                    <label>Source Language</label>
+                    <select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}>
+                      {languages.map((l) => (
+                        <option key={l.code} value={l.code}>{l.name}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="engine-field">
+                    <label>Target Language</label>
+                    <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)}>
+                      {languages.filter((l) => l.code !== 'auto').map((l) => (
+                        <option key={l.code} value={l.code}>{l.name}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="engine-field">
+                    <label>AI Model Engine</label>
+                    <select
+                      value={translationModel}
+                      onChange={(e) => setTranslationModel(e.target.value)}
+                      disabled={modelLoading}
+                    >
+                      {translationModels.map((m) => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
 
-                {error && (
-                  <div className="error-message">
-                    ⚠️ {error}
-                  </div>
-                )}
+                {error && <div className="studio-error-banner">⚠️ {error}</div>}
 
-                <div className="action-buttons-group">
+                <div className="engine-actions-row">
                   <button
                     type="button"
-                    className="stream-watch-button"
+                    className="studio-btn primary-live"
                     onClick={handleStartStreaming}
                     disabled={loading || isStreaming || (!file && !localVideoFile && !videoPath.trim())}
                   >
-                    {isStreaming ? (
-                      <>
-                        <span className="loader"></span>
-                        {streamBuffering ? 'Buffering Initial Subtitles...' : 'Streaming Live Subtitles...'}
-                      </>
-                    ) : (
-                      '▶ Play & Generate Live Subtitles'
-                    )}
+                    {isStreaming ? '⚡ Streaming Subtitles...' : '▶ Stream Live Subtitles'}
                   </button>
 
-                  {isStreaming ? (
-                    <button
-                      type="button"
-                      className="stop-stream-button"
-                      onClick={handleStopStreaming}
-                    >
-                      ⏹ Stop Live Stream
-                    </button>
-                  ) : (
-                    <button
-                      type="submit"
-                      className="submit-button batch-button"
-                      disabled={loading || isStreaming || (!file && !localVideoFile && !videoPath.trim())}
-                    >
-                      {loading ? (
-                        <>
-                          <span className="loader"></span>
-                          Processing Batch...
-                        </>
-                      ) : (
-                        '📥 Batch Generate SRT'
-                      )}
-                    </button>
-                  )}
-
-                  {(file || localVideoFile || videoPath.trim() || (subtitles && subtitles.length > 0)) && !loading && !isStreaming && (
-                    <button
-                      type="button"
-                      className="download-btn reset-btn"
-                      onClick={handleReset}
-                      title="Clear current selection and subtitles to start fresh"
-                    >
-                      🔄 Reset / New Media
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {/* Session Status / Telemetry */}
-              <div className="control-deck-card telemetry-card">
-                <div className="control-deck-card-header">
-                  <span className="control-deck-badge">TELEMETRY</span>
-                  <h3>Session Status</h3>
-                </div>
-                <div className="telemetry-grid">
-                  <div className="telemetry-stat">
-                    <span className="telemetry-label">Active Media</span>
-                    <span className="telemetry-value" title={selectedVideoName || (file ? file.name : (localVideoFile ? localVideoFile.name : (videoPath ? videoPath.split(/[\/\\]/).pop() : 'None selected')))}>
-                      {selectedVideoName || (file ? file.name : (localVideoFile ? localVideoFile.name : (videoPath ? videoPath.split(/[\/\\]/).pop() : 'None selected')))}
-                    </span>
-                  </div>
-                  <div className="telemetry-stat">
-                    <span className="telemetry-label">Engine Mode</span>
-                    <span className="telemetry-value highlight">
-                      {isStreaming ? '⚡ Live Sync Streaming' : (loading ? '⏳ Batch Processing' : 'Idle / Ready')}
-                    </span>
-                  </div>
-                  <div className="telemetry-stat">
-                    <span className="telemetry-label">Language Route</span>
-                    <span className="telemetry-value mono">
-                      {sourceLanguage.toUpperCase()} → {targetLanguage.toUpperCase()}
-                    </span>
-                  </div>
-                  <div className="telemetry-stat">
-                    <span className="telemetry-label">Subtitles</span>
-                    <span className="telemetry-value mono">
-                      {subtitles ? `${subtitles.length} lines` : '0 lines'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </form>
-
-        {/* Subtitles Preview */}
-        {subtitles && subtitles.length > 0 && (
-          <div className="subtitles-section full-width-subtitles">
-            <div className="subtitles-header">
-              <div className="subtitles-header-info">
-                <h2>Generated Subtitles</h2>
-                <span className="subtitles-count-badge">{subtitles.length} lines</span>
-              </div>
-              <div className="download-buttons">
-                <button onClick={() => downloadSubtitles('srt')} className="download-btn">
-                  📥 Download SRT
-                </button>
-                <button onClick={() => downloadSubtitles('vtt')} className="download-btn">
-                  📥 Download VTT
-                </button>
-              </div>
-            </div>
-            <p className="subtitle-hint">Click on any timestamp card to jump the media player to that point.</p>
-            <div className="subtitles-preview subtitles-grid-view">
-              {subtitles.map((subtitle, index) => {
-                const isActive = currentTime >= subtitle.start && currentTime <= subtitle.end
-                return (
-                  <div 
-                    key={index} 
-                    className={`subtitle-item ${isActive ? 'active' : ''}`}
-                    onClick={() => handleSeek(subtitle.start)}
-                    style={{ cursor: mediaUrl ? 'pointer' : 'default' }}
+                  <button
+                    type="button"
+                    className="studio-btn secondary-batch"
+                    onClick={handleSubmit}
+                    disabled={loading || isStreaming || (!file && !localVideoFile && !videoPath.trim())}
                   >
-                    <div className="subtitle-item-header">
-                      <span className="subtitle-index">#{index + 1}</span>
-                      <span className="timestamp">{formatTime(subtitle.start)} → {formatTime(subtitle.end)}</span>
-                    </div>
-                    <p className="text">{subtitle.text}</p>
+                    {loading ? '⏳ Processing Batch...' : '📥 Batch Transcribe SRT'}
+                  </button>
+
+                  {isStreaming && (
+                    <button type="button" className="studio-btn danger" onClick={handleStopStreaming}>
+                      ⏹ Stop Stream
+                    </button>
+                  )}
+
+                  {(file || localVideoFile || videoPath.trim()) && !loading && !isStreaming && (
+                    <button type="button" className="studio-btn text-only" onClick={handleReset}>
+                      🔄 Clear Media
+                    </button>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* Right Pane: Subtitle Track Timeline & Editor */}
+            <section className="workbench-editor-pane">
+              <div className="editor-pane-header">
+                <div className="editor-title">
+                  <span className="stage-badge">TIMELINE</span>
+                  <h3>Subtitles & Track Editor</h3>
+                  <span className="subtitle-count-badge">{subtitles ? subtitles.length : 0} Segments</span>
+                </div>
+
+                <div className="editor-search-box">
+                  <input
+                    type="text"
+                    placeholder="Search subtitles..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery && (
+                    <button type="button" className="clear-search" onClick={() => setSearchQuery('')}>
+                      ✕
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Interactive Timeline Track Overview */}
+              {subtitles && subtitles.length > 0 && totalDuration > 0 && (
+                <div className="studio-timeline-scrubber">
+                  <div className="timeline-track">
+                    {subtitles.map((sub, idx) => {
+                      const leftPct = (sub.start / totalDuration) * 100
+                      const widthPct = Math.max(0.5, ((sub.end - sub.start) / totalDuration) * 100)
+                      const isActive = currentTime >= sub.start && currentTime <= sub.end
+                      return (
+                        <div
+                          key={idx}
+                          className={`timeline-segment-block ${isActive ? 'active' : ''}`}
+                          style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                          onClick={() => handleSeek(sub.start)}
+                          title={`${formatTime(sub.start)}: ${sub.text}`}
+                        />
+                      )
+                    })}
+                    <div
+                      className="timeline-playhead-line"
+                      style={{ left: `${(currentTime / totalDuration) * 100}%` }}
+                    />
                   </div>
-                )
-              })}
+                </div>
+              )}
+
+              {/* Segment List Editor */}
+              <div ref={subtitleListRef} className="studio-subtitle-list">
+                {filteredSubtitles && filteredSubtitles.length > 0 ? (
+                  filteredSubtitles.map((subtitle, index) => {
+                    const isActive = currentTime >= subtitle.start && currentTime <= subtitle.end
+                    const duration = Math.max(0.1, subtitle.end - subtitle.start)
+                    const charCount = subtitle.text.length
+                    const cps = (charCount / duration).toFixed(1)
+                    const isCpsHigh = cps > 20
+
+                    return (
+                      <div
+                        key={index}
+                        ref={isActive ? activeSubtitleRef : null}
+                        className={`subtitle-editor-card ${isActive ? 'active' : ''}`}
+                      >
+                        <div className="card-top-row">
+                          <span className="segment-index">#{index + 1}</span>
+
+                          <div className="timecode-inputs">
+                            <input
+                              type="text"
+                              className="timecode-input"
+                              value={formatTime(subtitle.start)}
+                              onChange={(e) => handleUpdateSubtitleTime(index, 'start', e.target.value)}
+                              title="Start timecode"
+                            />
+                            <span className="time-arrow">→</span>
+                            <input
+                              type="text"
+                              className="timecode-input"
+                              value={formatTime(subtitle.end)}
+                              onChange={(e) => handleUpdateSubtitleTime(index, 'end', e.target.value)}
+                              title="End timecode"
+                            />
+                            <span className="duration-tag">{duration.toFixed(2)}s</span>
+                          </div>
+
+                          <div className="card-actions-row">
+                            <span className={`cps-badge ${isCpsHigh ? 'warning' : ''}`} title="Characters per second (CPS)">
+                              {cps} cps
+                            </span>
+                            <button
+                              type="button"
+                              className="card-action-btn seek"
+                              onClick={() => handleSeek(subtitle.start)}
+                              title="Jump player to segment start"
+                            >
+                              ▶ Jump
+                            </button>
+                            <button
+                              type="button"
+                              className="card-action-btn delete"
+                              onClick={() => handleDeleteSegment(index)}
+                              title="Delete segment"
+                            >
+                              🗑
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="card-body-row">
+                          <textarea
+                            className="subtitle-text-editor"
+                            value={subtitle.text}
+                            rows={Math.max(1, Math.ceil(subtitle.text.length / 45))}
+                            onChange={(e) => handleUpdateSubtitleText(index, e.target.value)}
+                            placeholder="Type subtitle line..."
+                          />
+                        </div>
+                      </div>
+                    )
+                  })
+                ) : (
+                  <div className="empty-subtitles-state">
+                    <div className="empty-sub-icon">📝</div>
+                    <h4>No Subtitle Track Generated Yet</h4>
+                    <p>Select your media file on the left and click <strong>Stream Live Subtitles</strong> or <strong>Batch Transcribe</strong> to generate subtitles.</p>
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* Audio Extraction Tab */}
+        {activeTab === 'extract' && (
+          <div className="tab-pane-container">
+            <div className="extract-panel-card">
+              <div className="panel-header">
+                <h3>⚡ Direct Fast Audio Extraction</h3>
+                <p>Extract uncompressed/high-quality audio from any local video file without uploading over HTTP.</p>
+              </div>
+
+              <div className="path-input-group">
+                <label>Video File Path</label>
+                <div className="path-row">
+                  <input
+                    type="text"
+                    value={videoPath}
+                    onChange={(e) => setVideoPath(e.target.value)}
+                    placeholder="Enter or browse local video path..."
+                  />
+                  <button type="button" className="studio-btn secondary" onClick={handleBrowseLocalFile} disabled={isBrowsing}>
+                    {isBrowsing ? '📂 Browsing...' : '📂 Browse File'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="extract-actions-bar">
+                <button
+                  type="button"
+                  className="studio-btn primary"
+                  onClick={handleExtractAudio}
+                  disabled={extracting || (!videoPath.trim() && !file && !localVideoFile)}
+                >
+                  {extracting ? '⏳ Extracting Audio...' : '⚡ Extract Audio Track'}
+                </button>
+              </div>
+
+              {extractError && <div className="studio-error-banner">{extractError}</div>}
+
+              {extractResult && (
+                <div className="extract-success-card">
+                  <h4>✓ Audio Extraction Complete</h4>
+                  <p><strong>File Name:</strong> {extractResult.audioFileName}</p>
+                  <p><strong>Size:</strong> {extractResult.audioSizeMB} MB</p>
+
+                  <div className="extract-btn-group">
+                    <button type="button" className="studio-btn secondary" onClick={() => downloadExtractedAudio(extractResult)}>
+                      📥 Download Audio (.WAV)
+                    </button>
+                    <button
+                      type="button"
+                      className="studio-btn primary"
+                      onClick={() => {
+                        useExtractedAudioForSubtitles(extractResult)
+                        setActiveTab('editor')
+                      }}
+                      disabled={useExtractedLoading}
+                    >
+                      {useExtractedLoading ? 'Generating Subtitles...' : '🎬 Generate Subtitles & Edit'}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
-      </div>
+
+        {/* Settings Tab */}
+        {activeTab === 'settings' && (
+          <div className="tab-pane-container">
+            <div className="settings-panel-card">
+              <h3>⚙ Studio Settings & System Telemetry</h3>
+              <div className="settings-grid">
+                <div className="setting-item">
+                  <label>Default Source Language</label>
+                  <select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}>
+                    {languages.map((l) => (
+                      <option key={l.code} value={l.code}>{l.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="setting-item">
+                  <label>Default Target Language</label>
+                  <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)}>
+                    {languages.filter((l) => l.code !== 'auto').map((l) => (
+                      <option key={l.code} value={l.code}>{l.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="setting-item">
+                  <label>Translation Engine Model</label>
+                  <select value={translationModel} onChange={(e) => setTranslationModel(e.target.value)}>
+                    {translationModels.map((m) => (
+                      <option key={m.value} value={m.value}>{m.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Keyboard Shortcuts Modal */}
+      {showShortcuts && (
+        <div className="shortcuts-modal-overlay" onClick={() => setShowShortcuts(false)}>
+          <div className="shortcuts-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>⌨ Studio Keyboard Shortcuts</h3>
+              <button type="button" className="close-btn" onClick={() => setShowShortcuts(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div className="shortcut-row"><kbd>Space</kbd> <span>Play / Pause Media</span></div>
+              <div className="shortcut-row"><kbd>←</kbd> / <kbd>→</kbd> <span>Seek Rewind / Forward 5 seconds</span></div>
+              <div className="shortcut-row"><kbd>,</kbd> / <kbd>.</kbd> <span>Frame Step Backward / Forward (0.04s)</span></div>
+              <div className="shortcut-row"><kbd>?</kbd> <span>Toggle Keyboard Shortcuts menu</span></div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
