@@ -1,0 +1,26 @@
+.app-container {
+  width: 100%;
+  min-height: 100vh;
+  position: relative;
+  overflow-x: hidden;
+  background: transparent; /* Fixed poster wall shows through the spacer */
+}
+
+/*
+  Studio workspace must have a solid background and sit above z-index:0
+  so it physically covers the fixed poster wall as it scrolls into view.
+*/
+.studio-main {
+  position: relative;
+  z-index: 1;
+  background: var(--bg-base, #0d0d0f);
+  width: 100%;
+  min-height: 100vh;
+  /* GPU layer promotion for zero-jank scrolling over fixed backdrop */
+  will-change: transform;
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  /* Subtle top separator line & shadow */
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.8);
+}
