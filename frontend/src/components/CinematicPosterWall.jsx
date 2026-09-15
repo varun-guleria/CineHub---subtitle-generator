@@ -253,11 +253,11 @@ const CinematicPosterWall = () => {
         </button>
       </div>
 
-      {/* Clean high-contrast Hero overlay */}
+      {/* Clean high-contrast Hero overlay with CineHub branding */}
       <div ref={heroOverlayRef} className="cinematic-hero-overlay">
         <div className="hero-glass-card">
           <h1 className="hero-editorial-title">
-            Cine<span>Sub</span>
+            Cine<span>Hub</span>
           </h1>
           <p className="hero-editorial-tagline">
             Real-time AI Subtitle Synthesis & Translation

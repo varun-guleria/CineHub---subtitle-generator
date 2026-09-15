@@ -821,7 +821,7 @@ const SubtitleGenerator = () => {
                 </svg>
               </div>
               <h1 className="brand-title">
-                <span className="brand-cine">Cine</span><span className="brand-sub">Sub</span>
+                <span className="brand-cine">Cine</span><span className="brand-sub">Hub</span>
                 <span className="brand-glow-dot"></span>
               </h1>
             </div>
