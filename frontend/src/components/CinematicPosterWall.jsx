@@ -3,14 +3,6 @@ import './CinematicPosterWall.css'
 
 /**
  * CinematicPosterWall — Ultra-Smooth 120Hz Hardware-Accelerated Scroll Engine
- *
- * Performance Contract:
- *  • ZERO React state updates on scroll path (no re-renders)
- *  • ZERO dynamic CSS `filter` recalculations (avoids GPU texture re-rasterization)
- *  • 100% composite-only properties: translate3d, scale3d, rotateY, opacity
- *  • Framerate-independent exponential decay lerp based on performance.now() dt
- *  • Dedicated hardware overlay for cinematic darkening
- *  • Cached container layout (zero offsetHeight reads on scroll)
  */
 const CinematicPosterWall = () => {
   const stageRef       = useRef(null)
@@ -28,11 +20,10 @@ const CinematicPosterWall = () => {
   const tickerTextRef  = useRef(null)
 
   useEffect(() => {
-    // Reduced motion media query check
+    // Reduced motion check
     const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     if (prefersReduced) return
 
-    // Layout cache (refreshed only on resize)
     let spacerH = 0
     const cacheLayout = () => {
       const el = document.getElementById('cinematic-spacer')
@@ -40,11 +31,10 @@ const CinematicPosterWall = () => {
     }
     cacheLayout()
 
-    // Scroll progress & timing state
-    let targetP    = 0
-    let currentP   = 0
-    let rafId      = null
-    let lastTime   = performance.now()
+    let targetP  = 0
+    let currentP = 0
+    let rafId    = null
+    let lastTime = performance.now()
 
     const PHASE_LABELS = [
       'Phase 1 · Stable Wall',
@@ -56,17 +46,14 @@ const CinematicPosterWall = () => {
     ]
     let lastPhaseIdx = -1
 
-    // Easing helpers
     const smoothstep = (t) => t * t * (3 - 2 * t)
     const clamp01    = (v) => (v < 0 ? 0 : v > 1 ? 1 : v)
 
-    // Hardware-accelerated compositor render function (0 repaints)
     const applyProgress = (p) => {
       const isMobile = window.innerWidth <= 768
       const isTablet = window.innerWidth > 768 && window.innerWidth <= 1024
       const mult     = isMobile ? 0.45 : isTablet ? 0.72 : 1.0
 
-      // Stage visibility toggle at terminal scroll
       if (p >= 1.0) {
         if (stageRef.current) stageRef.current.style.visibility = 'hidden'
         return
@@ -75,12 +62,12 @@ const CinematicPosterWall = () => {
         stageRef.current.style.visibility = 'visible'
       }
 
-      // ── Camera push: scale 1.0 → 1.22 (starts p=0.10) ──
+      // Camera push
       const zoomT    = clamp01((p - 0.10) / 0.62)
       const zoomE    = smoothstep(zoomT)
       const camScale = 1.0 + 0.22 * zoomE * mult
 
-      // ── Parallax drift & Wall separation ──
+      // Parallax drift & Wall separation
       let lx = 0, rx = 0, ty = 0, by = 0, rotY = 0
       if (p > 0.10) {
         const dT = clamp01((p - 0.10) / 0.36)
@@ -102,24 +89,24 @@ const CinematicPosterWall = () => {
         }
       }
 
-      // ── Center core scale & fade ──
+      // Center core scale & fade
       const centerScale   = 1.0 + 0.18 * zoomE
       let   centerOpacity = 1.0
       if (p > 0.56) centerOpacity = clamp01(1.0 - ((p - 0.56) / 0.28) * 1.25)
 
-      // ── Cinematic darkening via dedicated dark overlay (Composite only) ──
+      // Cinematic darkening
       let darkOverlayOpacity = 0
-      let vigOpacity         = 0.42
+      let vigOpacity         = 0.55
       if (p > 0.64) {
         const dkT          = clamp01((p - 0.64) / 0.30)
-        darkOverlayOpacity = 0.72 * dkT
-        vigOpacity         = 0.42 + 0.52 * dkT
+        darkOverlayOpacity = 0.75 * dkT
+        vigOpacity         = 0.55 + 0.40 * dkT
       }
 
-      // ── Master fade (p > 0.88) ──
+      // Master fade
       const masterOpacity = p > 0.88 ? clamp01(1.0 - (p - 0.88) / 0.12) : 1.0
 
-      // ── Hero overlay fade & drift ──
+      // Hero overlay fade & drift
       let heroOpacity = 1.0, heroTY = 0
       if (p > 0.05) {
         const hT    = clamp01((p - 0.05) / 0.24)
@@ -127,9 +114,7 @@ const CinematicPosterWall = () => {
         heroTY      = -42 * hT
       }
 
-      // ──────────────────────────────────────────────────────────
-      // DOM DIRECT MUTATIONS — 100% Composite Properties
-      // ──────────────────────────────────────────────────────────
+      // DOM Mutations
       const viewport = viewportRef.current
       if (viewport) {
         viewport.style.transform = `scale3d(${camScale.toFixed(5)},${camScale.toFixed(5)},1)`
@@ -181,7 +166,6 @@ const CinematicPosterWall = () => {
       const fill = tickerFillRef.current
       if (fill) fill.style.width = `${Math.round(p * 100)}%`
 
-      // Phase ticker text update (only on string boundary change)
       const phaseIdx = p >= 0.88 ? 5 : p >= 0.72 ? 4 : p >= 0.50 ? 3 : p >= 0.28 ? 2 : p >= 0.10 ? 1 : 0
       if (phaseIdx !== lastPhaseIdx) {
         lastPhaseIdx = phaseIdx
@@ -189,12 +173,10 @@ const CinematicPosterWall = () => {
       }
     }
 
-    // ── Framerate-independent Exponential Decay Lerp ──
     const tick = (now) => {
-      const dt = Math.min((now - lastTime) / 1000, 0.08) // clamp dt max 80ms
+      const dt = Math.min((now - lastTime) / 1000, 0.08)
       lastTime = now
 
-      // Lerp constant (15s^-1 = ultra smooth response on 60/120/144Hz)
       const lerpFactor = 1 - Math.exp(-15 * dt)
       const diff       = targetP - currentP
 
@@ -230,7 +212,6 @@ const CinematicPosterWall = () => {
     window.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('resize', onResize, { passive: true })
 
-    // Initialize initial frame
     onScroll()
 
     return () => {
@@ -272,19 +253,17 @@ const CinematicPosterWall = () => {
         </button>
       </div>
 
-      {/* Hero text */}
+      {/* Clean high-contrast Hero overlay */}
       <div ref={heroOverlayRef} className="cinematic-hero-overlay">
-        <div className="hero-editorial-badge">
-          <span className="badge-dot" />
-          <span className="badge-label">AI Multilingual Subtitle Suite</span>
+        <div className="hero-glass-card">
+          <h1 className="hero-editorial-title">
+            Cine<span>Sub</span>
+          </h1>
+          <p className="hero-editorial-tagline">
+            Real-time AI Subtitle Synthesis & Translation
+          </p>
         </div>
-        <h1 className="hero-editorial-title">
-          Cine<span>Sub</span>
-        </h1>
-        <p className="hero-editorial-tagline">
-          Real-time AI subtitle synthesis and translation,<br />
-          calibrated for film, television, and creator media.
-        </p>
+
         <button
           type="button"
           className="hero-scroll-indicator"
